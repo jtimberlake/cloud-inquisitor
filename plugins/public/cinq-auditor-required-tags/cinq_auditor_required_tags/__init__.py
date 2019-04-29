@@ -8,7 +8,7 @@ from cloud_inquisitor.constants import ActionStatus
 
 from cloud_inquisitor import CINQ_PLUGINS
 from cloud_inquisitor.config import dbconfig, ConfigOption
-from cloud_inquisitor.constants import NS_AUDITOR_REQUIRED_TAGS, NS_GOOGLE_ANALYTICS, NS_EMAIL, AuditActions, GDPR_COMPLIANCE_TAG_VALUES, MAX_AGE_TAG_VALUES, GDPR_TAGS
+from cloud_inquisitor.constants import NS_AUDITOR_REQUIRED_TAGS, NS_GOOGLE_ANALYTICS, NS_EMAIL, AuditActions
 from cloud_inquisitor.database import db
 from cloud_inquisitor.plugins import BaseAuditor
 from cloud_inquisitor.plugins.types.issues import RequiredTagsIssue
@@ -62,7 +62,10 @@ class RequiredTagsAuditor(BaseAuditor):
         ConfigOption('required_tags', ['owner', 'accounting', 'name'], 'array', 'List of required tags'),
         ConfigOption('lifecycle_expiration_days', 3, 'int',
                      'How many days we should set in the bucket policy for non-empty S3 buckets removal'),
-        ConfigOption('gdpr_accounts', [], 'array', 'List of accounts requiring GDPR compliance')
+        ConfigOption('gdpr_enabled', False, 'bool', 'Enable auditing for GDPR compliance'),
+        ConfigOption('gdpr_accounts', [], 'array', 'List of accounts requiring GDPR compliance'),
+        ConfigOption('gdpr_tag', 'gdpr_compliance', 'string', 'Name of GDPR compliance tag'),
+        ConfigOption('gdpr_tag_values', ['pending', 'v1'], 'array', 'List of valid values for GDPR compliance tag')
     )
 
     def __init__(self):
@@ -86,7 +89,10 @@ class RequiredTagsAuditor(BaseAuditor):
             resource_type.resource_type_id: resource_type.resource_type
             for resource_type in db.ResourceType.find()
         }
+        self.gdpr_enabled = dbconfig.get('gdpr_enabled', self.ns, False)
         self.gdpr_accounts = dbconfig.get('gdpr_accounts', self.ns, [])
+        self.gdpr_tag = dbconfig.get('gdpr_tag', self.ns, 'gdpr_compliance')
+        self.gdpr_tag_values = dbconfig.get('gdpr_tag_values', self.ns, ['pending', 'v1'])
         self.resource_classes = {resource.resource_type: resource for resource in map(
             lambda plugin: plugin.load(),
             CINQ_PLUGINS['cloud_inquisitor.plugins.types']['plugins']
@@ -414,10 +420,8 @@ class RequiredTagsAuditor(BaseAuditor):
         """
         if key == 'owner':
             return validate_email(value, self.partial_owner_match)
-        elif key == 'gdpr_compliance':
-            return value in GDPR_COMPLIANCE_TAG_VALUES
-        elif key == 'max-age' or key == 'data_retention':
-            return value in MAX_AGE_TAG_VALUES
+        elif key == self.gdpr_tag:
+            return value in self.gdpr_tag_values
         else:
             return True
 
@@ -450,9 +454,9 @@ class RequiredTagsAuditor(BaseAuditor):
 
         required_tags = list(self.required_tags)
 
-        # Add GDPR tags to required tags if the account must be GDPR compliant
-        if resource.account.account_name in self.gdpr_accounts:
-            required_tags.extend(GDPR_TAGS)
+        # Add GDPR tag to required tags if the account must be GDPR compliant
+        if self.gdpr_enabled and resource.account.account_name in self.gdpr_accounts:
+            required_tags.append(self.gdpr_tag)
 
         '''
         # Do not audit this resource if it is still in grace period
@@ -467,13 +471,6 @@ class RequiredTagsAuditor(BaseAuditor):
             elif not self.validate_tag(key, resource_tags[key]):
                 missing_tags.append(key)
                 notes.append('{} tag is not valid'.format(key))
-
-        # Support deprecated "data_retention" tag as a replacement for "max-age"
-        if 'max-age' in missing_tags and 'data_retention' in resource_tags:
-            missing_tags.remove('max-age')
-            if not self.validate_tag('data_retention', resource_tags['data_retention']):
-                missing_tags.append('data_retention')
-                notes.append('data_retention tag is not valid')
 
         return missing_tags, notes
 
